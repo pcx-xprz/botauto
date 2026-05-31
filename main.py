@@ -1,7 +1,12 @@
 """
-EXEGroup CEX Listing Airdrop — Auto Bot v5
-Real-time: pakai asyncio.Event + Telethon NewMessage handler.
-Bot balas → langsung diproses, tidak perlu polling.
+EXEGroup CEX Listing Airdrop — Auto Bot v6
+Real-time listener dengan BotListener yang benar.
+
+ROOT CAUSE FIX v6:
+  drain() dipanggil SEBELUM aksi (bukan sesudah), sehingga
+  pesan balasan bot yang datang cepat tidak ikut terbuang.
+  get_or_history() = ambil dari queue dulu, fallback ke history
+  jika queue kosong setelah timeout singkat.
 
 Alur percakapan bot (sudah diverifikasi):
   /start
@@ -152,72 +157,103 @@ async def join_if_needed(client, username: str):
 
 class BotListener:
     """
-    Register satu event handler NewMessage dari bot.
-    Setiap pesan baru dari bot langsung masuk ke queue asyncio.
-    Pakai wait() untuk ambil pesan berikutnya secara real-time.
+    Event-driven listener: setiap pesan baru dari bot langsung masuk asyncio.Queue.
+
+    ATURAN PENTING:
+      - drain() dipanggil SEBELUM melakukan aksi (send/click)
+        agar pesan lama tidak bercampur dengan respon aksi baru.
+      - JANGAN drain() setelah aksi — balasan bot yang datang cepat
+        akan ikut terbuang dan menyebabkan timeout.
+      - get_next() = ambil dari queue (real-time), fallback ke history
+        jika queue kosong setelah timeout singkat.
     """
+
     def __init__(self, client: TelegramClient, bot_username: str):
-        self.client   = client
-        self.bot      = bot_username
-        self._queue   = asyncio.Queue()
+        self.client  = client
+        self.bot     = bot_username
+        self._queue  = asyncio.Queue()
+        self._seen   = set()        # deduplikasi berdasarkan msg.id
         self._handler = None
 
     def start(self):
         @self.client.on(events.NewMessage(from_users=self.bot))
-        async def _handler(event):
-            await self._queue.put(event.message)
+        async def _on_msg(event):
+            msg = event.message
+            if msg.id not in self._seen:
+                self._seen.add(msg.id)
+                await self._queue.put(msg)
 
-        self._handler = _handler
+        self._handler = _on_msg
         info(f"Real-time listener aktif untuk @{self.bot}")
 
     def stop(self):
         if self._handler:
             self.client.remove_event_handler(self._handler)
 
-    async def wait(self, timeout: float = 25.0):
+    def drain(self):
         """
-        Tunggu pesan baru dari bot.
-        Return Message, atau None jika timeout.
-        Mengumpulkan semua pesan yang datang dalam 0.5 detik setelah pesan pertama
-        (bot kadang kirim beberapa pesan sekaligus).
+        Kosongkan queue secara SINKRON sebelum melakukan aksi.
+        HARUS dipanggil sebelum send/click, bukan sesudah.
+        """
+        count = 0
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                count += 1
+            except asyncio.QueueEmpty:
+                break
+        if count:
+            info(f"Queue dikosongkan ({count} pesan lama dibuang)")
+
+    async def get_next(self, timeout: float = 20.0) -> list:
+        """
+        Ambil pesan baru dari bot.
+        1. Coba ambil dari queue (real-time, hasil event handler)
+        2. Jika queue kosong setelah timeout → fallback ke get_messages (history)
+        Kumpulkan burst 0.6 detik setelah pesan pertama.
+        Return list pesan (bisa kosong jika benar-benar tidak ada).
         """
         try:
-            # Tunggu pesan pertama
+            # Tunggu pesan pertama dari queue
             first = await asyncio.wait_for(self._queue.get(), timeout=timeout)
             msgs  = [first]
 
-            # Drain pesan yang antri dalam 0.8 detik (multi-message burst)
-            deadline = asyncio.get_event_loop().time() + 0.8
+            # Kumpulkan burst (bot sering kirim 2-3 pesan sekaligus)
+            burst_end = asyncio.get_event_loop().time() + 0.6
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0: break
+                left = burst_end - asyncio.get_event_loop().time()
+                if left <= 0: break
                 try:
-                    msg = await asyncio.wait_for(self._queue.get(), timeout=remaining)
-                    msgs.append(msg)
+                    m = await asyncio.wait_for(self._queue.get(), timeout=left)
+                    msgs.append(m)
                 except asyncio.TimeoutError:
                     break
 
-            # Deduplicate berdasarkan message id
-            seen = set()
-            unique = []
+            info(f"Terima {len(msgs)} pesan baru dari bot (real-time)")
             for m in msgs:
-                if m.id not in seen:
-                    seen.add(m.id)
-                    unique.append(m)
-
-            info(f"Terima {len(unique)} pesan baru dari bot")
-            for m in unique:
-                botmsg(m.text or "(pesan tanpa teks)")
-            return unique
+                botmsg(m.text or "(no text)")
+            return msgs
 
         except asyncio.TimeoutError:
-            warn(f"Timeout {timeout}s — bot belum membalas.")
+            # Queue kosong → fallback ke history Telegram
+            info("Queue kosong, ambil dari history Telegram...")
+            history = await self.client.get_messages(self.bot, limit=6)
+            # Filter hanya pesan yang belum pernah kita proses
+            new = [m for m in history if m.id not in self._seen]
+            if new:
+                for m in new:
+                    self._seen.add(m.id)
+                info(f"History fallback: {len(new)} pesan baru")
+                for m in new:
+                    botmsg(m.text or "(no text)")
+                return new
+            # Benar-benar tidak ada pesan baru
+            warn(f"Tidak ada pesan baru setelah {timeout}s.")
             return []
 
-    async def drain(self):
-        """Kosongkan queue (pakai sebelum aksi agar tidak ada sisa)."""
-        while not self._queue.empty():
-            await self._queue.get()
+    async def get_latest_history(self, limit=8) -> list:
+        """Ambil pesan terbaru dari history (untuk cari tombol/context)."""
+        return await self.client.get_messages(self.bot, limit=limit)
 
 
 # ── MAIN AUTOMATION PER AKUN ──────────────────────────────────────────────────
@@ -261,10 +297,9 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
         # STEP 1 — /start
         # ──────────────────────────────────────────────────────────────────
         step(1, f"/start @{bot}")
-        await listener.drain()
+        listener.drain()                          # bersihkan sebelum kirim
         await client.send_message(bot, f"/start {config.REFERRAL_CODE}")
-
-        msgs = await listener.wait(timeout=20)
+        msgs = await listener.get_next(timeout=20)
         if not msgs:
             err("Bot tidak merespon /start. Abort."); return
 
@@ -273,52 +308,51 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
         # ──────────────────────────────────────────────────────────────────
         step(2, "Selesaikan captcha")
 
-        # Cari pesan yang mengandung soal math (bisa dari msgs step 1)
         captcha_msg = None
         for m in msgs:
             if solve_math(m.text or ""):
                 captcha_msg = m; break
 
         if not captcha_msg:
-            # Belum ada di msgs pertama, tunggu lagi
             warn("Menunggu soal captcha...")
-            extra = await listener.wait(timeout=15)
+            extra = await listener.get_next(timeout=15)
             for m in extra:
                 if solve_math(m.text or ""):
                     captcha_msg = m; break
 
         if not captcha_msg:
-            # Fallback: ambil dari history
-            history = await client.get_messages(bot, limit=6)
+            history = await listener.get_latest_history()
             for m in history:
                 if solve_math(m.text or ""):
                     captcha_msg = m; break
 
         if captcha_msg:
             answer = solve_math(captcha_msg.text)
-            # Klik Continue DULU
+
+            # Klik Continue DULU — drain SEBELUM klik
             if captcha_msg.buttons:
+                listener.drain()
                 clicked = await find_and_click([captcha_msg], ["continue","lanjut","next"])
                 if clicked:
-                    await asyncio.sleep(0.5)   # jeda singkat setelah klik
+                    # Tunggu respon klik Continue (bot kirim "👍Great, please enter the code")
+                    await listener.get_next(timeout=8)
                 else:
                     warn("Tombol Continue tidak ditemukan, langsung jawab.")
-            # Drain queue agar respon klik Continue tidak terpakai
-            await listener.drain()
-            # Kirim jawaban
+
+            # Kirim jawaban — drain SEBELUM kirim
+            listener.drain()
             info(f"Kirim jawaban: {c(GREEN+BOLD, answer)}")
             await client.send_message(bot, answer)
-
-            conf_msgs = await listener.wait(timeout=20)
+            conf_msgs = await listener.get_next(timeout=20)
             txt = conf_msgs[0].text if conf_msgs else ""
             if has_kw(txt, ["correct","benar","✅","welcome","listing"]):
                 ok("Captcha benar! ✅")
             else:
                 warn("Konfirmasi 'correct' tidak terdeteksi, lanjut...")
-            msgs = conf_msgs   # pesan berikutnya diproses dari sini
+            msgs = conf_msgs
         else:
             warn("Soal captcha tidak ditemukan, lanjut...")
-            msgs = await client.get_messages(bot, limit=6)
+            msgs = await listener.get_latest_history()
 
         await asyncio.sleep(D)
 
@@ -327,40 +361,33 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
         # ──────────────────────────────────────────────────────────────────
         step(3, "Join grup utama + klik Done")
 
-        # Cari pesan welcome yang ada tombol Done dari msgs sebelumnya
-        # atau ambil dari history jika belum ada
-        welcome_msgs = msgs if msgs else await client.get_messages(bot, limit=8)
-
         info("Cek & join @PEGABANK_EXE...")
         await join_if_needed(client, "PEGABANK_EXE")
-        await asyncio.sleep(D)
+        await asyncio.sleep(1)
 
-        await listener.drain()
-        clicked = await find_and_click(welcome_msgs, ["done","selesai","✅"])
-        if not clicked:
-            # Tombol Done mungkin ada di pesan lebih lama
-            history = await client.get_messages(bot, limit=10)
-            clicked = await find_and_click(history, ["done","selesai","✅"])
-
-        if clicked:
-            ok("Tombol Done diklik.")
-            msgs = await listener.wait(timeout=25)
-            if not msgs:
-                warn("Bot belum balas setelah Done, ambil dari history...")
-                msgs = await client.get_messages(bot, limit=6)
+        # Cari tombol Done dari msgs atau history
+        search = msgs if msgs else await listener.get_latest_history(10)
+        if not await find_and_click(search, ["done","selesai","✅"]):
+            search = await listener.get_latest_history(10)
+            if not await find_and_click(search, ["done","selesai","✅"]):
+                err("Tombol Done tidak ditemukan!")
+                msgs = await listener.get_latest_history(); await asyncio.sleep(D)
+            else:
+                ok("Tombol Done diklik.")
+                msgs = await listener.get_next(timeout=25)
+                if not msgs: msgs = await listener.get_latest_history()
         else:
-            err("Tombol Done tidak ditemukan!")
-            msgs = await client.get_messages(bot, limit=6)
+            ok("Tombol Done diklik.")
+            msgs = await listener.get_next(timeout=25)
+            if not msgs: msgs = await listener.get_latest_history()
 
         await asyncio.sleep(D)
 
         # ──────────────────────────────────────────────────────────────────
         # STEP 4 — Kirim Twitter username
-        # Bot: "enter your twitter username with '@'"
         # ──────────────────────────────────────────────────────────────────
         step(4, "Kirim Twitter username")
 
-        # Cari pesan minta twitter
         tw_prompt = None
         for m in msgs:
             if has_kw(m.text or "", ["twitter","tweet","'@'","enter your twitter"]):
@@ -368,7 +395,7 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
 
         if not tw_prompt:
             warn("Menunggu pesan Twitter dari bot...")
-            extra = await listener.wait(timeout=25)
+            extra = await listener.get_next(timeout=25)
             for m in extra:
                 if has_kw(m.text or "", ["twitter","tweet","'@'","enter your twitter"]):
                     tw_prompt = m; break
@@ -380,20 +407,18 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
         if twitter:
             tw_handle = f"@{twitter}"
             info(f"Kirim Twitter: {c(WHITE+BOLD, tw_handle)}")
-            await listener.drain()
+            listener.drain()                      # drain SEBELUM kirim
             await client.send_message(bot, tw_handle)
-
-            tw_reply = await listener.wait(timeout=25)
-            first_txt = tw_reply[0].text if tw_reply else ""
-
+            tw_reply = await listener.get_next(timeout=25)
+            first_txt = (tw_reply[0].text if tw_reply else "")
             if has_kw(first_txt, ["invalid","format","error","try again","incorrect"]):
                 warn("Format ditolak, coba tanpa @...")
-                await listener.drain()
+                listener.drain()
                 await client.send_message(bot, twitter)
-                tw_reply = await listener.wait(timeout=25)
+                tw_reply = await listener.get_next(timeout=25)
             else:
                 ok("Twitter diterima!")
-            msgs = tw_reply
+            msgs = tw_reply if tw_reply else await listener.get_latest_history()
         else:
             warn("Twitter kosong, skip.")
 
@@ -401,7 +426,6 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
 
         # ──────────────────────────────────────────────────────────────────
         # STEP 5 — Advertiser channel + klik Done
-        # Bot: "Join our Advertiser channel ... Done or Skip"
         # ──────────────────────────────────────────────────────────────────
         step(5, "Task Advertiser channel + klik Done")
 
@@ -412,7 +436,7 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
 
         if not adv_msg:
             warn("Menunggu pesan Advertiser channel...")
-            extra = await listener.wait(timeout=25)
+            extra = await listener.get_next(timeout=25)
             for m in extra:
                 if has_kw(m.text or "", ["advertiser","airdrop6","optional","done","skip"]):
                     adv_msg = m; break
@@ -421,41 +445,33 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
         if adv_msg:
             botmsg(adv_msg.text or "")
 
-        # Join advertiser channel dulu
         info("Cek & join @airdrop6officialchannel...")
         await join_if_needed(client, "airdrop6officialchannel")
-        await asyncio.sleep(D)
+        await asyncio.sleep(1)
 
-        await listener.drain()
-        search_list = [adv_msg] if adv_msg else msgs
-        if not search_list:
-            search_list = await client.get_messages(bot, limit=8)
-
-        # Klik Done (bukan Skip supaya dapat +40 EXE)
-        clicked = await find_and_click(search_list, ["done","selesai","✅"])
+        # Klik Done — drain SEBELUM klik
+        search = [adv_msg] if adv_msg else (msgs or await listener.get_latest_history(10))
+        clicked = await find_and_click(search, ["done","selesai","✅"])
         if not clicked:
-            history = await client.get_messages(bot, limit=10)
-            clicked = await find_and_click(history, ["done","selesai","✅"])
+            search = await listener.get_latest_history(10)
+            clicked = await find_and_click(search, ["done","selesai","✅"])
         if not clicked:
             warn("Done tidak ada, coba Skip...")
-            history = await client.get_messages(bot, limit=10)
-            clicked = await find_and_click(history, ["skip","lewati"])
+            search = await listener.get_latest_history(10)
+            clicked = await find_and_click(search, ["skip","lewati"])
 
         if clicked:
             ok("Tombol Done/Skip (advertiser) diklik.")
-            msgs = await listener.wait(timeout=25)
-            if not msgs:
-                warn("Bot belum balas setelah Done advertiser, ambil history...")
-                msgs = await client.get_messages(bot, limit=6)
+            msgs = await listener.get_next(timeout=25)
+            if not msgs: msgs = await listener.get_latest_history()
         else:
             err("Tombol Done/Skip tidak ditemukan!")
-            msgs = await client.get_messages(bot, limit=6)
+            msgs = await listener.get_latest_history()
 
         await asyncio.sleep(D)
 
         # ──────────────────────────────────────────────────────────────────
         # STEP 6 — Submit wallet address
-        # Bot: "Please submit your BASE or ETH wallet address below"
         # ──────────────────────────────────────────────────────────────────
         step(6, "Submit wallet address")
 
@@ -466,30 +482,26 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
 
         if not wallet_prompt:
             warn("Menunggu permintaan wallet dari bot...")
-            extra = await listener.wait(timeout=25)
+            extra = await listener.get_next(timeout=25)
             for m in extra:
                 if has_kw(m.text or "", ["wallet","address","base","eth","submit"]):
                     wallet_prompt = m; break
-            if extra: msgs = extra
 
         if wallet_prompt:
             botmsg(wallet_prompt.text)
             ok("Bot meminta wallet address!")
-
             if wallet:
                 info(f"Kirim wallet: {c(WHITE+BOLD, wallet)}")
-                await listener.drain()
+                listener.drain()                  # drain SEBELUM kirim
                 await client.send_message(bot, wallet)
-
-                wallet_reply = await listener.wait(timeout=25)
+                wallet_reply = await listener.get_next(timeout=25)
                 final_txt = wallet_reply[0].text if wallet_reply else ""
-                botmsg(final_txt)
-
+                if final_txt: botmsg(final_txt)
                 if has_kw(final_txt, ["success","✅","received","thank","registered",
                                        "berhasil","saved","congrat","complete"]):
                     ok("🎉 Wallet diterima! Semua task selesai!")
                 else:
-                    warn("Wallet terkirim, tunggu konfirmasi dari tim.")
+                    ok("Wallet terkirim, menunggu konfirmasi dari tim.")
             else:
                 warn("Wallet kosong, tidak dikirim.")
         else:
