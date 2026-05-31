@@ -1,19 +1,21 @@
 """
-EXEGroup CEX Listing Airdrop — Auto Bot
-Alur percakapan bot yang sudah diverifikasi:
+EXEGroup CEX Listing Airdrop — Auto Bot v5
+Real-time: pakai asyncio.Event + Telethon NewMessage handler.
+Bot balas → langsung diproses, tidak perlu polling.
 
+Alur percakapan bot (sudah diverifikasi):
   /start
-    └─> [1] Captcha: klik Continue → kirim jawaban → tunggu "correct"
-    └─> [2] Pesan welcome + tombol Done
-              → join @PEGABANK_EXE (cek dulu, join jika belum)
-              → klik Done → tunggu balas bot
-    └─> [3] Bot minta Twitter username ("enter your twitter username with '@'")
-              → kirim @username → tunggu balas bot
-    └─> [4] Bot kirim Advertiser task + tombol Done/Skip
-              → join @airdrop6officialchannel (cek dulu, join jika belum)
-              → klik Done → tunggu balas bot
-    └─> [5] Bot minta wallet ("submit your BASE or ETH wallet address")
-              → kirim wallet → SELESAI
+  [1] Captcha: klik Continue → kirim jawaban → tunggu "correct"
+  [2] Pesan welcome + tombol Done
+        → join @PEGABANK_EXE (cek member dulu)
+        → klik Done → tunggu balas
+  [3] Bot minta Twitter username
+        → kirim @username → tunggu balas
+  [4] Bot kirim Advertiser task + tombol Done/Skip
+        → join @airdrop6officialchannel (cek member dulu)
+        → klik Done → tunggu balas
+  [5] Bot minta wallet address
+        → kirim wallet → SELESAI
 """
 
 import asyncio
@@ -21,7 +23,7 @@ import os
 import re
 import sys
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest, GetParticipantRequest
 from telethon.errors import (
     UserAlreadyParticipantError,
@@ -42,16 +44,16 @@ WHITE   = "\033[97m"
 BOLD    = "\033[1m"
 RESET   = "\033[0m"
 
-def c(color, text):  return f"{color}{text}{RESET}"
-def info(msg):       print(f"   {c(CYAN,       '[*]')} {msg}")
-def ok(msg):         print(f"   {c(GREEN,       '[+]')} {msg}")
-def warn(msg):       print(f"   {c(YELLOW,      '[!]')} {msg}")
-def err(msg):        print(f"   {c(RED,         '[✗]')} {msg}")
-def step(n, msg):    print(f"\n{c(MAGENTA+BOLD, f'[STEP {n}]')} {msg}")
-def banner(msg):     print(f"\n{c(CYAN+BOLD, msg)}{RESET}")
-def botmsg(text):
-    preview = (text or "").replace("\n", " │ ")[:260]
-    print(f"   {c(WHITE+BOLD, '🤖')} {c(WHITE, preview)}")
+def c(color, text): return f"{color}{text}{RESET}"
+def info(msg):  print(f"   {c(CYAN,       '[*]')} {msg}")
+def ok(msg):    print(f"   {c(GREEN,       '[+]')} {msg}")
+def warn(msg):  print(f"   {c(YELLOW,      '[!]')} {msg}")
+def err(msg):   print(f"   {c(RED,         '[✗]')} {msg}")
+def step(n, m): print(f"\n{c(MAGENTA+BOLD, f'[STEP {n}]')} {m}")
+def banner(m):  print(f"\n{c(CYAN+BOLD, m)}{RESET}")
+def botmsg(t):
+    p = (t or "").replace("\n", " │ ")[:280]
+    print(f"   {c(WHITE+BOLD,'🤖')} {c(WHITE, p)}")
 
 
 # ── File loaders ──────────────────────────────────────────────────────────────
@@ -59,106 +61,61 @@ def botmsg(text):
 def load_accounts() -> list[dict]:
     path = config.ACCOUNTS_FILE
     if not os.path.exists(path):
-        err(f"File {path} tidak ditemukan!")
-        sys.exit(1)
+        err(f"File {path} tidak ditemukan!"); sys.exit(1)
     out = []
     with open(path) as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+            if not line or line.startswith("#"): continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 3:
-                warn(f"accounts.txt baris {lineno} format salah, dilewati.")
-                continue
-            out.append({
-                "session_name": parts[0],
-                "api_id":       int(parts[1]),
-                "api_hash":     parts[2],
-            })
+                warn(f"baris {lineno} format salah, dilewati."); continue
+            out.append({"session_name": parts[0], "api_id": int(parts[1]), "api_hash": parts[2]})
     return out
-
 
 def load_lines(path: str) -> list[str]:
     if not os.path.exists(path):
-        warn(f"File {path} tidak ditemukan.")
-        return []
+        warn(f"File {path} tidak ditemukan."); return []
     with open(path) as f:
         return [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-
 def clean_twitter(raw: str) -> str:
-    """Hapus semua @ di depan, kembalikan username bersih."""
     return raw.lstrip("@").strip()
 
 
 # ── Math solver ───────────────────────────────────────────────────────────────
 
 def solve_math(text: str) -> str | None:
-    normalized = text.replace("×","*").replace("÷","/").replace(" x "," * ")
-    m = re.search(r"(\d+)\s*([\+\-\*\/])\s*(\d+)\s*=", normalized)
-    if not m:
-        return None
+    norm = text.replace("×","*").replace("÷","/").replace(" x "," * ")
+    m = re.search(r"(\d+)\s*([\+\-\*\/])\s*(\d+)\s*=", norm)
+    if not m: return None
     a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
     res = {"+": a+b, "-": a-b, "*": a*b, "/": a//b}.get(op)
-    if res is None:
-        return None
-    info(f"Soal: {c(WHITE, f'{a} {op} {b}')} = {c(GREEN, str(res))}")
+    if res is None: return None
+    info(f"Soal: {c(WHITE, f'{a} {op} {b}')} = {c(GREEN+BOLD, str(res))}")
     return str(res)
 
 
-# ── Telegram helpers ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def has_kw(text: str, kws: list[str]) -> bool:
     t = (text or "").lower()
     return any(k.lower() in t for k in kws)
 
-
-async def last_id(client, bot: str) -> int:
-    msgs = await client.get_messages(bot, limit=1)
-    return msgs[0].id if msgs else 0
-
-
-async def wait_reply(client, bot: str, after_id: int,
-                     timeout: int = 20, poll: float = 1.5) -> list:
-    """
-    Polling aktif: tunggu sampai ada pesan baru dari bot (id > after_id).
-    Kembalikan list pesan baru. Return [] jika timeout.
-    """
-    elapsed = 0.0
-    while elapsed < timeout:
-        await asyncio.sleep(poll)
-        elapsed += poll
-        msgs = await client.get_messages(bot, limit=6)
-        new = [m for m in msgs if m.id > after_id]
-        if new:
-            info(f"Bot membalas ({len(new)} pesan baru)")
-            return new
-    warn(f"Timeout {timeout}s — bot tidak membalas.")
-    return []
-
-
-async def find_and_click(msgs: list, kws: list[str]) -> tuple[bool, object | None]:
-    """
-    Scan semua pesan → cari inline button yang cocok keyword → klik.
-    Return (True, pesan_yg_diklik) atau (False, None).
-    """
+async def find_and_click(msgs: list, kws: list[str]) -> bool:
     for msg in msgs:
-        if not msg.buttons:
-            continue
+        if not msg.buttons: continue
         for row in msg.buttons:
             for btn in row:
                 if has_kw(btn.text, kws):
                     info(f"Klik tombol: '{c(WHITE+BOLD, btn.text)}'")
                     await btn.click()
-                    return True, msg
-    return False, None
-
+                    return True
+    return False
 
 async def is_member(client, username: str) -> bool:
-    """Cek apakah akun sudah menjadi member channel/grup."""
     try:
-        clean = username.replace("https://t.me/", "").replace("@", "").strip()
+        clean = username.replace("https://t.me/","").replace("@","").strip()
         entity = await client.get_entity(clean)
         me = await client.get_me()
         await client(GetParticipantRequest(entity, me))
@@ -166,21 +123,13 @@ async def is_member(client, username: str) -> bool:
     except UserNotParticipantError:
         return False
     except Exception:
-        # Jika tidak bisa cek, anggap belum join agar aman
         return False
 
-
 async def join_if_needed(client, username: str):
-    """Join channel/grup hanya jika belum menjadi member."""
-    clean = username.replace("https://t.me/", "").replace("@", "").strip()
-    if not clean or clean.lower() in ("joinchat",):
-        return
-
-    already = await is_member(client, clean)
-    if already:
-        ok(f"Sudah member @{clean}, skip join.")
-        return
-
+    clean = username.replace("https://t.me/","").replace("@","").strip()
+    if not clean or clean.lower() in ("joinchat",): return
+    if await is_member(client, clean):
+        ok(f"Sudah member @{clean}, skip join."); return
     info(f"Bergabung ke: {c(WHITE, '@'+clean)}")
     try:
         entity = await client.get_entity(clean)
@@ -189,16 +138,86 @@ async def join_if_needed(client, username: str):
     except UserAlreadyParticipantError:
         ok(f"Sudah member @{clean}")
     except FloodWaitError as e:
-        warn(f"FloodWait {e.seconds}s untuk @{clean}, tunggu...")
+        warn(f"FloodWait {e.seconds}s, tunggu...")
         await asyncio.sleep(e.seconds + 2)
-        await join_if_needed(client, clean)   # retry sekali
+        await join_if_needed(client, clean)
     except ChannelPrivateError:
-        err(f"Channel @{clean} private, tidak bisa join.")
+        err(f"Channel @{clean} private.")
     except Exception as e:
-        if "already participant" in str(e).lower():
-            ok(f"Sudah member @{clean}")
-        else:
-            err(f"Gagal join @{clean}: {e}")
+        if "already participant" in str(e).lower(): ok(f"Sudah member @{clean}")
+        else: err(f"Gagal join @{clean}: {e}")
+
+
+# ── Real-time message waiter ──────────────────────────────────────────────────
+
+class BotListener:
+    """
+    Register satu event handler NewMessage dari bot.
+    Setiap pesan baru dari bot langsung masuk ke queue asyncio.
+    Pakai wait() untuk ambil pesan berikutnya secara real-time.
+    """
+    def __init__(self, client: TelegramClient, bot_username: str):
+        self.client   = client
+        self.bot      = bot_username
+        self._queue   = asyncio.Queue()
+        self._handler = None
+
+    def start(self):
+        @self.client.on(events.NewMessage(from_users=self.bot))
+        async def _handler(event):
+            await self._queue.put(event.message)
+
+        self._handler = _handler
+        info(f"Real-time listener aktif untuk @{self.bot}")
+
+    def stop(self):
+        if self._handler:
+            self.client.remove_event_handler(self._handler)
+
+    async def wait(self, timeout: float = 25.0):
+        """
+        Tunggu pesan baru dari bot.
+        Return Message, atau None jika timeout.
+        Mengumpulkan semua pesan yang datang dalam 0.5 detik setelah pesan pertama
+        (bot kadang kirim beberapa pesan sekaligus).
+        """
+        try:
+            # Tunggu pesan pertama
+            first = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+            msgs  = [first]
+
+            # Drain pesan yang antri dalam 0.8 detik (multi-message burst)
+            deadline = asyncio.get_event_loop().time() + 0.8
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0: break
+                try:
+                    msg = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    msgs.append(msg)
+                except asyncio.TimeoutError:
+                    break
+
+            # Deduplicate berdasarkan message id
+            seen = set()
+            unique = []
+            for m in msgs:
+                if m.id not in seen:
+                    seen.add(m.id)
+                    unique.append(m)
+
+            info(f"Terima {len(unique)} pesan baru dari bot")
+            for m in unique:
+                botmsg(m.text or "(pesan tanpa teks)")
+            return unique
+
+        except asyncio.TimeoutError:
+            warn(f"Timeout {timeout}s — bot belum membalas.")
+            return []
+
+    async def drain(self):
+        """Kosongkan queue (pakai sebelum aksi agar tidak ada sisa)."""
+        while not self._queue.empty():
+            await self._queue.get()
 
 
 # ── MAIN AUTOMATION PER AKUN ──────────────────────────────────────────────────
@@ -208,19 +227,15 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
 
     twitter = clean_twitter(twitter)
 
-    banner("═" * 60)
+    banner("═" * 62)
     print(f"  {c(BOLD+CYAN,'🚀 AKUN')}   : {c(WHITE, session_name)}")
     print(f"  {c(CYAN,'Wallet')}    : {c(WHITE, wallet  or c(RED,'(kosong)'))}")
     print(f"  {c(CYAN,'Twitter')}   : {c(WHITE, ('@'+twitter) if twitter else c(RED,'(kosong)'))}")
-    banner("═" * 60)
+    banner("═" * 62)
 
-    session_path = os.path.join(
-        config.SESSIONS_DIR,
-        session_name.replace(".session", "")
-    )
+    session_path = os.path.join(config.SESSIONS_DIR, session_name.replace(".session",""))
     if not os.path.exists(f"{session_path}.session"):
-        err(f"Session tidak ada: {session_path}.session — dilewati.")
-        return
+        err(f"Session tidak ada: {session_path}.session — dilewati."); return
 
     client = TelegramClient(session_path, api_id, api_hash)
     try:
@@ -229,315 +244,273 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
         err(f"Gagal konek: {e}"); return
 
     if not await client.is_user_authorized():
-        err("Session belum login. Jalankan login_helper.py."); await client.disconnect(); return
+        err("Session belum login."); await client.disconnect(); return
 
     me = await client.get_me()
     ok(f"Login: {c(WHITE, me.first_name)} (ID: {me.id})")
 
     bot = config.BOT_USERNAME
-    D   = config.DELAY_STEP     # alias pendek
+    D   = config.DELAY_STEP
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 1 — /start → tunggu pesan captcha dari bot
-    # ──────────────────────────────────────────────────────────────────────────
-    step(1, f"/start @{bot}")
-    chk = await last_id(client, bot)
-    await client.send_message(bot, f"/start {config.REFERRAL_CODE}")
+    # Buat listener real-time
+    listener = BotListener(client, bot)
+    listener.start()
 
-    captcha_msgs = await wait_reply(client, bot, chk, timeout=15)
-    if not captcha_msgs:
-        err("Bot tidak merespon /start. Abort."); await client.disconnect(); return
+    try:
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 1 — /start
+        # ──────────────────────────────────────────────────────────────────
+        step(1, f"/start @{bot}")
+        await listener.drain()
+        await client.send_message(bot, f"/start {config.REFERRAL_CODE}")
 
-    for m in captcha_msgs:
-        botmsg(m.text or "")
+        msgs = await listener.wait(timeout=20)
+        if not msgs:
+            err("Bot tidak merespon /start. Abort."); return
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 2 — Captcha: klik Continue dulu → kirim jawaban → tunggu "correct"
-    # ──────────────────────────────────────────────────────────────────────────
-    step(2, "Selesaikan captcha")
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 2 — Captcha
+        # ──────────────────────────────────────────────────────────────────
+        step(2, "Selesaikan captcha")
 
-    # Cari pesan yang mengandung soal math
-    captcha_msg = None
-    for m in captcha_msgs:
-        if solve_math(m.text or ""):
-            captcha_msg = m
-            break
-
-    if not captcha_msg:
-        # Coba ambil lebih banyak pesan (mungkin captcha ada di pesan lebih lama)
-        all_msgs = await client.get_messages(bot, limit=8)
-        for m in all_msgs:
+        # Cari pesan yang mengandung soal math (bisa dari msgs step 1)
+        captcha_msg = None
+        for m in msgs:
             if solve_math(m.text or ""):
-                captcha_msg = m
-                break
+                captcha_msg = m; break
 
-    if captcha_msg:
-        answer = solve_math(captcha_msg.text)
+        if not captcha_msg:
+            # Belum ada di msgs pertama, tunggu lagi
+            warn("Menunggu soal captcha...")
+            extra = await listener.wait(timeout=15)
+            for m in extra:
+                if solve_math(m.text or ""):
+                    captcha_msg = m; break
 
-        # Klik Continue DULU sesuai instruksi bot
-        if captcha_msg.buttons:
-            clicked, _ = await find_and_click([captcha_msg], ["continue","lanjut","next"])
-            if clicked:
-                await asyncio.sleep(D)
+        if not captcha_msg:
+            # Fallback: ambil dari history
+            history = await client.get_messages(bot, limit=6)
+            for m in history:
+                if solve_math(m.text or ""):
+                    captcha_msg = m; break
+
+        if captcha_msg:
+            answer = solve_math(captcha_msg.text)
+            # Klik Continue DULU
+            if captcha_msg.buttons:
+                clicked = await find_and_click([captcha_msg], ["continue","lanjut","next"])
+                if clicked:
+                    await asyncio.sleep(0.5)   # jeda singkat setelah klik
+                else:
+                    warn("Tombol Continue tidak ditemukan, langsung jawab.")
+            # Drain queue agar respon klik Continue tidak terpakai
+            await listener.drain()
+            # Kirim jawaban
+            info(f"Kirim jawaban: {c(GREEN+BOLD, answer)}")
+            await client.send_message(bot, answer)
+
+            conf_msgs = await listener.wait(timeout=20)
+            txt = conf_msgs[0].text if conf_msgs else ""
+            if has_kw(txt, ["correct","benar","✅","welcome","listing"]):
+                ok("Captcha benar! ✅")
             else:
-                warn("Tombol Continue tidak ditemukan, langsung kirim jawaban.")
+                warn("Konfirmasi 'correct' tidak terdeteksi, lanjut...")
+            msgs = conf_msgs   # pesan berikutnya diproses dari sini
         else:
-            warn("Tidak ada tombol Continue, langsung kirim jawaban.")
+            warn("Soal captcha tidak ditemukan, lanjut...")
+            msgs = await client.get_messages(bot, limit=6)
 
-        # Kirim jawaban
-        info(f"Kirim jawaban: {c(GREEN+BOLD, answer)}")
-        chk = await last_id(client, bot)
-        await client.send_message(bot, answer)
+        await asyncio.sleep(D)
 
-        # Tunggu konfirmasi "correct"
-        correct_msgs = await wait_reply(client, bot, chk, timeout=15)
-        for m in correct_msgs:
-            botmsg(m.text or "")
-        if has_kw((correct_msgs[0].text if correct_msgs else ""), ["correct","benar","✅","welcome"]):
-            ok("Captcha benar! ✅")
-        else:
-            warn("Captcha mungkin salah, coba lanjut...")
-    else:
-        warn("Soal captcha tidak ditemukan (mungkin sudah selesai sebelumnya).")
-        correct_msgs = await client.get_messages(bot, limit=6)
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 3 — Join @PEGABANK_EXE → klik Done
+        # ──────────────────────────────────────────────────────────────────
+        step(3, "Join grup utama + klik Done")
 
-    await asyncio.sleep(D)
+        # Cari pesan welcome yang ada tombol Done dari msgs sebelumnya
+        # atau ambil dari history jika belum ada
+        welcome_msgs = msgs if msgs else await client.get_messages(bot, limit=8)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 3 — Ambil pesan welcome + tombol Done
-    #           → join @PEGABANK_EXE dulu → klik Done → tunggu balas
-    # ──────────────────────────────────────────────────────────────────────────
-    step(3, "Join grup utama + klik Done")
+        info("Cek & join @PEGABANK_EXE...")
+        await join_if_needed(client, "PEGABANK_EXE")
+        await asyncio.sleep(D)
 
-    # Ambil pesan terbaru (pesan welcome ada di sini)
-    welcome_msgs = await client.get_messages(bot, limit=8)
+        await listener.drain()
+        clicked = await find_and_click(welcome_msgs, ["done","selesai","✅"])
+        if not clicked:
+            # Tombol Done mungkin ada di pesan lebih lama
+            history = await client.get_messages(bot, limit=10)
+            clicked = await find_and_click(history, ["done","selesai","✅"])
 
-    # Cari pesan yang ada tombol Done
-    done_msg = None
-    for m in welcome_msgs:
-        if m.buttons:
-            for row in m.buttons:
-                for btn in row:
-                    if has_kw(btn.text, ["done","selesai","✅"]):
-                        done_msg = m
-                        break
-
-    # Join @PEGABANK_EXE sebelum klik Done
-    info("Cek & join @PEGABANK_EXE...")
-    await join_if_needed(client, "PEGABANK_EXE")
-    await asyncio.sleep(D)
-
-    # Klik tombol Done
-    chk = await last_id(client, bot)
-    if done_msg:
-        clicked, _ = await find_and_click([done_msg], ["done","selesai","✅"])
-    else:
-        clicked, _ = await find_and_click(welcome_msgs, ["done","selesai","✅"])
-
-    if clicked:
-        ok("Tombol Done diklik.")
-        after_done = await wait_reply(client, bot, chk, timeout=20)
-        for m in after_done:
-            botmsg(m.text or "")
-    else:
-        err("Tombol Done tidak ditemukan!")
-        after_done = await client.get_messages(bot, limit=6)
-
-    await asyncio.sleep(D)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 4 — Bot minta Twitter username
-    #           → tunggu pesan yang berisi "twitter username with '@'"
-    #           → kirim @username → tunggu balas
-    # ──────────────────────────────────────────────────────────────────────────
-    step(4, "Kirim Twitter username")
-
-    # Cari pesan minta twitter dari respon setelah Done
-    twitter_prompt = None
-    for m in after_done:
-        if has_kw(m.text or "", ["twitter username","twitter","enter your twitter","'@'"]):
-            twitter_prompt = m
-            break
-
-    if not twitter_prompt:
-        # Mungkin belum datang, tunggu lagi
-        warn("Menunggu pesan permintaan Twitter...")
-        extra = await wait_reply(client, bot, after_done[0].id if after_done else 0, timeout=15)
-        for m in extra:
-            botmsg(m.text or "")
-            if has_kw(m.text or "", ["twitter username","twitter","enter your twitter","'@'"]):
-                twitter_prompt = m
-                break
-        if not twitter_prompt and extra:
-            twitter_prompt = extra[0]   # ambil apapun yang ada
-
-    if twitter_prompt:
-        botmsg(twitter_prompt.text or "")
-
-    if twitter:
-        tw_handle = f"@{twitter}"
-        info(f"Kirim Twitter: {c(WHITE+BOLD, tw_handle)}")
-        chk = await last_id(client, bot)
-        await client.send_message(bot, tw_handle)
-
-        tw_reply = await wait_reply(client, bot, chk, timeout=20)
-        for m in tw_reply:
-            botmsg(m.text or "")
-
-        # Cek apakah ditolak (format invalid)
-        first_reply_text = tw_reply[0].text if tw_reply else ""
-        if has_kw(first_reply_text, ["invalid","format","error","try again","incorrect"]):
-            warn("Format @username ditolak, coba tanpa @...")
-            chk2 = await last_id(client, bot)
-            await client.send_message(bot, twitter)
-            tw_reply = await wait_reply(client, bot, chk2, timeout=20)
-            for m in tw_reply:
-                botmsg(m.text or "")
-        else:
-            ok("Twitter terkirim!")
-    else:
-        warn("Twitter kosong, skip.")
-        tw_reply = after_done
-
-    await asyncio.sleep(D)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 5 — Advertiser channel task
-    #           Pesan: "Join our Advertiser channel" + tombol Done/Skip
-    #           → cek & join @airdrop6officialchannel dulu
-    #           → klik Done → tunggu balas bot
-    # ──────────────────────────────────────────────────────────────────────────
-    step(5, "Task Advertiser channel + klik Done")
-
-    # Cari pesan advertiser dari respon setelah twitter
-    adv_msg = None
-    for m in tw_reply:
-        if has_kw(m.text or "", ["advertiser","airdrop6","optional","done","skip"]):
-            adv_msg = m
-            break
-
-    if not adv_msg:
-        warn("Menunggu pesan Advertiser channel...")
-        extra = await wait_reply(
-            client, bot,
-            tw_reply[0].id if tw_reply else 0,
-            timeout=15
-        )
-        for m in extra:
-            botmsg(m.text or "")
-            if has_kw(m.text or "", ["advertiser","airdrop6","optional","done","skip"]):
-                adv_msg = m
-                break
-        if not adv_msg and extra:
-            adv_msg = extra[0]
-
-    if adv_msg:
-        botmsg(adv_msg.text or "")
-
-    # Join @airdrop6officialchannel sebelum klik Done/Skip
-    info("Cek & join @airdrop6officialchannel...")
-    await join_if_needed(client, "airdrop6officialchannel")
-    await asyncio.sleep(D)
-
-    # Klik Done (bukan Skip — ambil reward EXE)
-    adv_search_list = [adv_msg] if adv_msg else []
-    if not adv_search_list:
-        adv_search_list = await client.get_messages(bot, limit=5)
-
-    chk = await last_id(client, bot)
-    clicked, _ = await find_and_click(adv_search_list, ["done","selesai","✅"])
-
-    if not clicked:
-        # Fallback: scan lebih banyak pesan
-        all_recent = await client.get_messages(bot, limit=10)
-        clicked, _ = await find_and_click(all_recent, ["done","selesai","✅"])
-
-    if clicked:
-        ok("Tombol Done (advertiser) diklik.")
-        after_adv = await wait_reply(client, bot, chk, timeout=20)
-        for m in after_adv:
-            botmsg(m.text or "")
-    else:
-        warn("Tombol Done tidak ditemukan, coba klik Skip...")
-        chk = await last_id(client, bot)
-        all_recent = await client.get_messages(bot, limit=10)
-        clicked, _ = await find_and_click(all_recent, ["skip","lewati"])
         if clicked:
-            ok("Tombol Skip diklik.")
-            after_adv = await wait_reply(client, bot, chk, timeout=20)
-            for m in after_adv:
-                botmsg(m.text or "")
+            ok("Tombol Done diklik.")
+            msgs = await listener.wait(timeout=25)
+            if not msgs:
+                warn("Bot belum balas setelah Done, ambil dari history...")
+                msgs = await client.get_messages(bot, limit=6)
+        else:
+            err("Tombol Done tidak ditemukan!")
+            msgs = await client.get_messages(bot, limit=6)
+
+        await asyncio.sleep(D)
+
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 4 — Kirim Twitter username
+        # Bot: "enter your twitter username with '@'"
+        # ──────────────────────────────────────────────────────────────────
+        step(4, "Kirim Twitter username")
+
+        # Cari pesan minta twitter
+        tw_prompt = None
+        for m in msgs:
+            if has_kw(m.text or "", ["twitter","tweet","'@'","enter your twitter"]):
+                tw_prompt = m; break
+
+        if not tw_prompt:
+            warn("Menunggu pesan Twitter dari bot...")
+            extra = await listener.wait(timeout=25)
+            for m in extra:
+                if has_kw(m.text or "", ["twitter","tweet","'@'","enter your twitter"]):
+                    tw_prompt = m; break
+            if extra: msgs = extra
+
+        if tw_prompt:
+            botmsg(tw_prompt.text)
+
+        if twitter:
+            tw_handle = f"@{twitter}"
+            info(f"Kirim Twitter: {c(WHITE+BOLD, tw_handle)}")
+            await listener.drain()
+            await client.send_message(bot, tw_handle)
+
+            tw_reply = await listener.wait(timeout=25)
+            first_txt = tw_reply[0].text if tw_reply else ""
+
+            if has_kw(first_txt, ["invalid","format","error","try again","incorrect"]):
+                warn("Format ditolak, coba tanpa @...")
+                await listener.drain()
+                await client.send_message(bot, twitter)
+                tw_reply = await listener.wait(timeout=25)
+            else:
+                ok("Twitter diterima!")
+            msgs = tw_reply
+        else:
+            warn("Twitter kosong, skip.")
+
+        await asyncio.sleep(D)
+
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 5 — Advertiser channel + klik Done
+        # Bot: "Join our Advertiser channel ... Done or Skip"
+        # ──────────────────────────────────────────────────────────────────
+        step(5, "Task Advertiser channel + klik Done")
+
+        adv_msg = None
+        for m in msgs:
+            if has_kw(m.text or "", ["advertiser","airdrop6","optional","done","skip"]):
+                adv_msg = m; break
+
+        if not adv_msg:
+            warn("Menunggu pesan Advertiser channel...")
+            extra = await listener.wait(timeout=25)
+            for m in extra:
+                if has_kw(m.text or "", ["advertiser","airdrop6","optional","done","skip"]):
+                    adv_msg = m; break
+            if extra: msgs = extra
+
+        if adv_msg:
+            botmsg(adv_msg.text or "")
+
+        # Join advertiser channel dulu
+        info("Cek & join @airdrop6officialchannel...")
+        await join_if_needed(client, "airdrop6officialchannel")
+        await asyncio.sleep(D)
+
+        await listener.drain()
+        search_list = [adv_msg] if adv_msg else msgs
+        if not search_list:
+            search_list = await client.get_messages(bot, limit=8)
+
+        # Klik Done (bukan Skip supaya dapat +40 EXE)
+        clicked = await find_and_click(search_list, ["done","selesai","✅"])
+        if not clicked:
+            history = await client.get_messages(bot, limit=10)
+            clicked = await find_and_click(history, ["done","selesai","✅"])
+        if not clicked:
+            warn("Done tidak ada, coba Skip...")
+            history = await client.get_messages(bot, limit=10)
+            clicked = await find_and_click(history, ["skip","lewati"])
+
+        if clicked:
+            ok("Tombol Done/Skip (advertiser) diklik.")
+            msgs = await listener.wait(timeout=25)
+            if not msgs:
+                warn("Bot belum balas setelah Done advertiser, ambil history...")
+                msgs = await client.get_messages(bot, limit=6)
         else:
             err("Tombol Done/Skip tidak ditemukan!")
-            after_adv = await client.get_messages(bot, limit=6)
+            msgs = await client.get_messages(bot, limit=6)
 
-    await asyncio.sleep(D)
+        await asyncio.sleep(D)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # STEP 6 — Bot minta wallet address
-    #           Pesan: "submit your BASE or ETH wallet address"
-    #           → HANYA kirim jika bot benar-benar memintanya
-    # ──────────────────────────────────────────────────────────────────────────
-    step(6, "Submit wallet address")
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 6 — Submit wallet address
+        # Bot: "Please submit your BASE or ETH wallet address below"
+        # ──────────────────────────────────────────────────────────────────
+        step(6, "Submit wallet address")
 
-    # Cari pesan yang minta wallet dari respon setelah advertiser Done
-    wallet_prompt = None
-    for m in after_adv:
-        if has_kw(m.text or "", ["wallet","address","base","eth","submit"]):
-            wallet_prompt = m
-            break
-
-    if not wallet_prompt:
-        warn("Menunggu permintaan wallet dari bot...")
-        extra = await wait_reply(
-            client, bot,
-            after_adv[0].id if after_adv else 0,
-            timeout=20
-        )
-        for m in extra:
-            botmsg(m.text or "")
+        wallet_prompt = None
+        for m in msgs:
             if has_kw(m.text or "", ["wallet","address","base","eth","submit"]):
-                wallet_prompt = m
-                break
+                wallet_prompt = m; break
 
-    if wallet_prompt:
-        botmsg(wallet_prompt.text or "")
-        ok("Bot meminta wallet address.")
+        if not wallet_prompt:
+            warn("Menunggu permintaan wallet dari bot...")
+            extra = await listener.wait(timeout=25)
+            for m in extra:
+                if has_kw(m.text or "", ["wallet","address","base","eth","submit"]):
+                    wallet_prompt = m; break
+            if extra: msgs = extra
 
-        if wallet:
-            info(f"Kirim wallet: {c(WHITE+BOLD, wallet)}")
-            chk = await last_id(client, bot)
-            await client.send_message(bot, wallet)
+        if wallet_prompt:
+            botmsg(wallet_prompt.text)
+            ok("Bot meminta wallet address!")
 
-            wallet_reply = await wait_reply(client, bot, chk, timeout=20)
-            for m in wallet_reply:
-                botmsg(m.text or "")
+            if wallet:
+                info(f"Kirim wallet: {c(WHITE+BOLD, wallet)}")
+                await listener.drain()
+                await client.send_message(bot, wallet)
 
-            if has_kw((wallet_reply[0].text if wallet_reply else ""),
-                      ["success","✅","received","thank","registered","berhasil","saved"]):
-                ok("Wallet diterima bot! ✅")
+                wallet_reply = await listener.wait(timeout=25)
+                final_txt = wallet_reply[0].text if wallet_reply else ""
+                botmsg(final_txt)
+
+                if has_kw(final_txt, ["success","✅","received","thank","registered",
+                                       "berhasil","saved","congrat","complete"]):
+                    ok("🎉 Wallet diterima! Semua task selesai!")
+                else:
+                    warn("Wallet terkirim, tunggu konfirmasi dari tim.")
             else:
-                warn("Tidak ada konfirmasi spesifik dari bot.")
+                warn("Wallet kosong, tidak dikirim.")
         else:
-            warn("Wallet kosong, tidak dikirim.")
-    else:
-        err("Bot tidak meminta wallet! Cek log di atas.")
+            err("Bot tidak meminta wallet — cek log di atas.")
 
-    await asyncio.sleep(D)
+    finally:
+        listener.stop()
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
     # SUMMARY
-    # ──────────────────────────────────────────────────────────────────────────
-    banner("─" * 60)
+    # ──────────────────────────────────────────────────────────────────────
+    banner("─" * 62)
     print(f"  📋 {c(BOLD,'Summary')} — {c(WHITE, session_name)}")
-    banner("─" * 60)
+    banner("─" * 62)
     print(f"   ✅ Captcha selesai")
     print(f"   ✅ Join @PEGABANK_EXE")
     print(f"   ✅ Klik Done (task utama)")
-    print(f"   ✅ Twitter: @{twitter if twitter else c(RED,'(kosong)')}")
+    print(f"   ✅ Twitter   : @{twitter or c(RED,'(kosong)')}")
     print(f"   ✅ Join @airdrop6officialchannel")
-    print(f"   ✅ Klik Done (advertiser task)")
-    print(f"   ✅ Wallet: {wallet[:20] + '...' if wallet else c(RED,'(kosong)')}")
+    print(f"   ✅ Klik Done (advertiser)")
+    print(f"   ✅ Wallet    : {(wallet[:24]+'...') if wallet else c(RED,'(kosong)')}")
     print()
 
     await client.disconnect()
@@ -546,9 +519,9 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
-    banner("╔══════════════════════════════════════════════════════╗")
-    banner("║    EXEGroup Airdrop Bot  —  verified flow v4        ║")
-    banner("╚══════════════════════════════════════════════════════╝")
+    banner("╔══════════════════════════════════════════════════════════╗")
+    banner("║    EXEGroup Airdrop Bot  —  real-time listener v5       ║")
+    banner("╚══════════════════════════════════════════════════════════╝")
 
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
 
@@ -604,9 +577,9 @@ async def main():
             print(c(YELLOW, f"\n   ⏳ Jeda {w}s sebelum akun berikutnya..."))
             await asyncio.sleep(w)
 
-    banner("═" * 60)
+    banner("═" * 62)
     ok(c(GREEN+BOLD, "✅ Semua akun selesai diproses!"))
-    banner("═" * 60)
+    banner("═" * 62)
 
 
 if __name__ == "__main__":
