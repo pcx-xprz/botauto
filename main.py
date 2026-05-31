@@ -35,6 +35,9 @@ from telethon.errors import (
     UserNotParticipantError,
     FloodWaitError,
     ChannelPrivateError,
+    UserDeactivatedBanError,
+    AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
 )
 
 import config
@@ -279,10 +282,26 @@ async def run_account(session_name: str, api_id: int, api_hash: str,
     except Exception as e:
         err(f"Gagal konek: {e}"); return
 
-    if not await client.is_user_authorized():
-        err("Session belum login."); await client.disconnect(); return
+    # ── Cek status akun ───────────────────────────────────────────────────────
+    try:
+        if not await client.is_user_authorized():
+            err("Session tidak authorized (mungkin logout). Dilewati.")
+            await client.disconnect(); return
 
-    me = await client.get_me()
+        me = await client.get_me()
+    except UserDeactivatedBanError:
+        err(f"Akun {session_name} BANNED/SUSPENDED oleh Telegram! Dilewati.")
+        await client.disconnect(); return
+    except AuthKeyUnregisteredError:
+        err(f"Auth key tidak valid untuk {session_name}. Dilewati.")
+        await client.disconnect(); return
+    except AuthKeyDuplicatedError:
+        err(f"Auth key duplikat untuk {session_name}. Dilewati.")
+        await client.disconnect(); return
+    except Exception as e:
+        err(f"Gagal cek akun {session_name}: {e}. Dilewati.")
+        await client.disconnect(); return
+
     ok(f"Login: {c(WHITE, me.first_name)} (ID: {me.id})")
 
     bot = config.BOT_USERNAME
@@ -561,13 +580,20 @@ async def main():
         wallet  = addresses[idx] if idx < len(addresses) else ""
         twitter = twitters[idx]  if idx < len(twitters)  else ""
 
-        await run_account(
-            session_name = acc["session_name"],
-            api_id       = acc["api_id"],
-            api_hash     = acc["api_hash"],
-            wallet       = wallet,
-            twitter      = twitter,
-        )
+        try:
+            await run_account(
+                session_name = acc["session_name"],
+                api_id       = acc["api_id"],
+                api_hash     = acc["api_hash"],
+                wallet       = wallet,
+                twitter      = twitter,
+            )
+        except UserDeactivatedBanError:
+            err(f"Akun {acc['session_name']} BANNED/SUSPENDED! Lanjut ke akun berikutnya.")
+        except AuthKeyUnregisteredError:
+            err(f"Auth key {acc['session_name']} tidak valid! Lanjut ke akun berikutnya.")
+        except Exception as e:
+            err(f"Error tak terduga pada {acc['session_name']}: {e}. Lanjut ke akun berikutnya.")
 
         if count < len(selected) - 1:
             w = config.DELAY_ACCOUNT
